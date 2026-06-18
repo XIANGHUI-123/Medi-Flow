@@ -1,0 +1,41 @@
+# ── Medi-Flow Orchestrator  ─  Python dependencies ──
+
+# Backend
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.19
+
+# Database
+sqlalchemy==2.0.36
+pymysql==1.1.1
+cryptography==44.0.0
+
+# Auth
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.2.1
+
+# AI / NLP
+httpx==0.28.1
+openai==1.58.1
+
+# Speech-to-text
+SpeechRecognition==3.12.0
+pydub==0.25.1
+
+# Image processing
+Pillow==11.1.0
+
+# Frontend
+streamlit==1.41.1
+audio-recorder-streamlit==0.0.10
+streamlit-webrtc==0.47.9
+
+# Env
+python-dotenv==1.0.1
+
+# Pandemic Heatmap
+folium==0.19.5
+streamlit-folium==0.24.0
+scikit-learn==1.6.1
+pandas==2.2.3
