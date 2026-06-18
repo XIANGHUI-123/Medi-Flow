@@ -1,0 +1,949 @@
+"""
+pharmacist_dashboard.py  ─  Medi‑Flow Orchestrator  ─  Pharmacy Prescription UI
+
+Modern, grouped‑by‑patient pharmacy dashboard:
+  • Prescriptions grouped **per patient** in expandable cards
+  • Line‑by‑line medicine list: Name | Dosage | Duration | AI Qty | Final Qty | Status | Actions
+  • AI‑suggested quantities with editable inputs & per‑patient batch confirm
+  • Expandable **doctor notes & consultation info** per patient
+  • **Urgency / low‑stock** colour‑coding  (🔴 urgent  🟠 moderate  🟢 normal)
+  • Per‑medicine Send Reminder button
+  • Batch confirm all patients at once
+  • Patient info panel: phone, address, allergies, medical history
+
+Entry point: render()
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+import requests
+import streamlit as st
+
+# ── Backend config ───────────────────────────────────────────
+API_BASE = "http://127.0.0.1:8000"
+
+_STATUS_CFG = {
+    "pending":     {"icon": "🟡", "color": "#FFA726", "label": "Pending"},
+    "sent":        {"icon": "🟢", "color": "#66BB6A", "label": "Sent"},
+    "in_progress": {"icon": "🔵", "color": "#42A5F5", "label": "In Progress"},
+    "completed":   {"icon": "✅", "color": "#4CAF50", "label": "Completed"},
+}
+
+# Medicines considered *urgent* (case‑insensitive substring match)
+_URGENT_KEYWORDS = [
+    "antibiotic", "amoxicillin", "azithromycin", "insulin",
+    "epinephrine", "adrenaline", "steroid", "prednisolone",
+]
+# Medicines considered *moderate priority*
+_MODERATE_KEYWORDS = [
+    "paracetamol", "acetaminophen", "ibuprofen", "nsaid",
+    "fever", "pain", "analgesic",
+]
+
+
+def _headers() -> dict:
+    return {"Authorization": f"Bearer {st.session_state.token}"}
+
+
+# ═══════════════════════════════════════════════════════════
+#  CSS
+# ═══════════════════════════════════════════════════════════
+
+_CSS = """
+<style>
+/* Badges */
+.ph-badge {
+    display:inline-block; padding:3px 10px; border-radius:10px;
+    font-size:13px; font-weight:600; color:#fff;
+}
+.ph-badge-blue   { background:#2196F3; }
+.ph-badge-green  { background:#4CAF50; }
+.ph-badge-gray   { background:#9E9E9E; }
+.ph-badge-orange { background:#FFA726; }
+.ph-badge-red    { background:#EF5350; }
+
+/* Urgency left‑border lines */
+.ph-urgent   { border-left:4px solid #EF5350; padding-left:8px; }
+.ph-moderate { border-left:4px solid #FFA726; padding-left:8px; }
+.ph-normal   { border-left:4px solid #66BB6A; padding-left:8px; }
+
+/* Divider inside cards */
+.ph-divider {
+    margin:6px 0; border:none; border-top:1px solid #e0e0e0;
+}
+
+/* Patient info grid */
+.ph-info-grid {
+    display:grid; grid-template-columns:1fr 1fr; gap:4px 16px;
+    font-size:14px;
+}
+.ph-info-grid b { color:#555; }
+</style>
+"""
+
+
+# ═══════════════════════════════════════════════════════════
+#  Data helpers
+# ═══════════════════════════════════════════════════════════
+
+def _load_prescriptions() -> list[dict]:
+    """Fetch all pharmacy orders (enriched with patient + doctor notes)."""
+    try:
+        resp = requests.get(
+            f"{API_BASE}/api/orders/pharmacy",
+            headers=_headers(),
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except requests.RequestException:
+        pass
+    return []
+
+
+def _load_consultations(patient_id: int) -> list[dict]:
+    """Fetch latest consultation transcripts for a patient."""
+    try:
+        resp = requests.get(
+            f"{API_BASE}/api/patients/{patient_id}/consultations",
+            headers=_headers(),
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except requests.RequestException:
+        pass
+    return []
+
+
+def _group_by_patient(prescriptions: list[dict]) -> dict[int, dict]:
+    """
+    { patient_id: { patient_name, patient_id, phone_number, home_address,
+                     allergies, medical_history, doctor_notes, doctor_name,
+                     consultation_date, medicines: [...] } }
+    """
+    groups: dict[int, dict] = {}
+    for p in prescriptions:
+        pid = p.get("patient_id", 0)
+        if pid not in groups:
+            groups[pid] = {
+                "patient_id":        pid,
+                "patient_name":      p.get("patient_name", "Unknown"),
+                "phone_number":      p.get("phone_number", ""),
+                "home_address":      p.get("home_address", ""),
+                "allergies":         p.get("allergies", ""),
+                "medical_history":   p.get("medical_history", ""),
+                "doctor_notes":      p.get("doctor_notes", ""),
+                "doctor_name":       p.get("doctor_name", ""),
+                "consultation_date": p.get("consultation_date", ""),
+                "medicines":         [],
+            }
+        groups[pid]["medicines"].append(p)
+    return groups
+
+
+def _calculate_medicine_quantity(order_id: int) -> dict:
+    """Call AI to calculate the suggested quantity for a prescription."""
+    try:
+        resp = requests.post(
+            f"{API_BASE}/api/pharmacy/calculate-quantity",
+            data={"order_id": order_id},
+            headers=_headers(),
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except requests.RequestException:
+        pass
+    return {
+        "quantity": "N/A",
+        "unit": "units",
+        "calculation": "Could not reach AI service.",
+    }
+
+
+def _send_patient_reminder(order_id: int) -> dict:
+    """Call AI to generate a patient reminder message."""
+    try:
+        resp = requests.post(
+            f"{API_BASE}/api/pharmacy/send-reminder",
+            data={"order_id": order_id},
+            headers=_headers(),
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except requests.RequestException:
+        pass
+    return {"message": "Could not reach AI service.", "type": "error", "sent": False}
+
+
+def _update_status(order_id: int, new_status: str):
+    """Update order status via API."""
+    try:
+        resp = requests.patch(
+            f"{API_BASE}/api/orders/{order_id}/status",
+            data={"status": new_status},
+            headers=_headers(),
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            st.success(f"Order #{order_id} → **{new_status}**")
+            st.rerun()
+        else:
+            st.error(resp.json().get("detail", resp.text))
+    except requests.RequestException as e:
+        st.error(f"Backend not reachable: {e}")
+
+
+# ═══════════════════════════════════════════════════════════
+#  Urgency helpers
+# ═══════════════════════════════════════════════════════════
+
+def _urgency_level(medicine_name: str) -> str:
+    """Return 'urgent', 'moderate', or 'normal' based on medicine name."""
+    name = (medicine_name or "").lower()
+    if any(kw in name for kw in _URGENT_KEYWORDS):
+        return "urgent"
+    if any(kw in name for kw in _MODERATE_KEYWORDS):
+        return "moderate"
+    return "normal"
+
+
+def _urgency_css_class(medicine_name: str) -> str:
+    lvl = _urgency_level(medicine_name)
+    return f"ph-{lvl}"
+
+
+def _urgency_badge(medicine_name: str) -> str:
+    lvl = _urgency_level(medicine_name)
+    if lvl == "urgent":
+        return "<span class='ph-badge ph-badge-red'>🔴 Urgent</span>"
+    if lvl == "moderate":
+        return "<span class='ph-badge ph-badge-orange'>🟠 Moderate</span>"
+    return ""
+
+
+# ═══════════════════════════════════════════════════════════
+#  Badge helpers
+# ═══════════════════════════════════════════════════════════
+
+def _status_badge(status: str) -> str:
+    cfg = _STATUS_CFG.get(status, _STATUS_CFG["pending"])
+    return (
+        f"<span class='ph-badge' style='background:{cfg['color']};'>"
+        f"{cfg['icon']} {cfg['label']}</span>"
+    )
+
+
+def _qty_state_badge(order_id: int) -> str:
+    if f"ph_confirmed_{order_id}" in st.session_state:
+        return "<span class='ph-badge ph-badge-green'>✅ Confirmed</span>"
+    if f"ph_qty_{order_id}" in st.session_state:
+        return "<span class='ph-badge ph-badge-blue'>🤖 AI Suggested</span>"
+    return "<span class='ph-badge ph-badge-gray'>⏳ Awaiting</span>"
+
+
+# ═══════════════════════════════════════════════════════════
+#  MAIN ENTRY POINT
+# ═══════════════════════════════════════════════════════════
+
+def render():
+    st.markdown(_CSS, unsafe_allow_html=True)
+
+    st.title("💊 Pharmacy Prescription Dashboard")
+    st.caption(
+        "AI‑powered prescription management — grouped per patient, "
+        "with doctor notes, urgency highlighting, and batch operations."
+    )
+
+    all_rx = _load_prescriptions()
+    if not all_rx:
+        st.info("No prescription orders at the moment.")
+        return
+
+    # ── Filters ──────────────────────────────────────────────
+    with st.container(border=True):
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            search_q = st.text_input(
+                "🔍 Search Patient or Medicine",
+                placeholder="Type name or medicine …",
+                key="ph_search",
+            )
+        with fc2:
+            status_f = st.selectbox(
+                "Status",
+                ["All", "pending", "sent", "in_progress", "completed"],
+                key="ph_status_f",
+            )
+        with fc3:
+            sort_opt = st.selectbox(
+                "Sort Patients By",
+                ["Name (A‑Z)", "Name (Z‑A)", "Most Medicines", "Newest Order"],
+                key="ph_sort",
+            )
+
+    # Apply filters
+    filtered = all_rx
+    if search_q:
+        q = search_q.lower()
+        filtered = [
+            p for p in filtered
+            if q in p.get("patient_name", "").lower()
+            or q in p.get("medicine", "").lower()
+        ]
+    if status_f != "All":
+        filtered = [p for p in filtered if p.get("status") == status_f]
+
+    groups = _group_by_patient(filtered)
+    sorted_groups = list(groups.values())
+
+    if sort_opt == "Name (A‑Z)":
+        sorted_groups.sort(key=lambda g: g["patient_name"].lower())
+    elif sort_opt == "Name (Z‑A)":
+        sorted_groups.sort(key=lambda g: g["patient_name"].lower(), reverse=True)
+    elif sort_opt == "Most Medicines":
+        sorted_groups.sort(key=lambda g: len(g["medicines"]), reverse=True)
+    elif sort_opt == "Newest Order":
+        sorted_groups.sort(
+            key=lambda g: max(
+                (m.get("created_at", "") for m in g["medicines"]), default=""
+            ),
+            reverse=True,
+        )
+
+    # ── Metrics ──────────────────────────────────────────────
+    all_groups = _group_by_patient(all_rx)
+    total_patients = len(all_groups)
+    total_rx_n = len(all_rx)
+    pending  = sum(1 for p in all_rx if p.get("status") == "pending")
+    sent     = sum(1 for p in all_rx if p.get("status") == "sent")
+    in_prog  = sum(1 for p in all_rx if p.get("status") == "in_progress")
+    done     = sum(1 for p in all_rx if p.get("status") == "completed")
+    urgent_n = sum(1 for p in all_rx if _urgency_level(p.get("medicine", "")) == "urgent")
+
+    with st.container(border=True):
+        mc = st.columns(7)
+        mc[0].metric("👥 Patients", total_patients)
+        mc[1].metric("💊 Prescriptions", total_rx_n)
+        mc[2].metric("🟡 Pending", pending)
+        mc[3].metric("🟢 Sent", sent)
+        mc[4].metric("🔵 In Progress", in_prog)
+        mc[5].metric("✅ Completed", done)
+        mc[6].metric("🔴 Urgent", urgent_n)
+
+    # ── Tabs ─────────────────────────────────────────────────
+    tab_orders, tab_ai = st.tabs([
+        "👥 Patient Orders",
+        "🤖 AI Quantity Review",
+    ])
+
+    with tab_orders:
+        _render_patient_orders(sorted_groups)
+
+    with tab_ai:
+        _render_ai_review(sorted_groups)
+
+
+# ═══════════════════════════════════════════════════════════
+#  TAB 1 — Patient Order Cards
+# ═══════════════════════════════════════════════════════════
+
+def _render_patient_orders(groups: list[dict]):
+    if not groups:
+        st.info("No prescriptions match the current filters.")
+        return
+
+    for grp in groups:
+        pid  = grp["patient_id"]
+        name = grp["patient_name"]
+        meds = grp["medicines"]
+        n    = len(meds)
+
+        statuses = [m.get("status", "pending") for m in meds]
+        all_done = all(s == "completed" for s in statuses)
+        has_urgent = any(
+            _urgency_level(m.get("medicine", "")) == "urgent" for m in meds
+        )
+
+        badge = "✅" if all_done else ("🔴" if has_urgent else "🟡")
+
+        with st.expander(
+            f"{badge}  **{name}**  —  {n} medicine{'s' if n != 1 else ''}"
+            + ("  ⚠️ URGENT" if has_urgent else ""),
+            expanded=not all_done,
+        ):
+            # ── Patient info + Doctor notes (side by side) ───
+            info_col, notes_col = st.columns(2)
+
+            with info_col:
+                phone   = grp.get("phone_number") or "—"
+                address = grp.get("home_address")  or "—"
+                allergy = grp.get("allergies")      or "None known"
+                st.markdown(
+                    f"<div class='ph-info-grid'>"
+                    f"<div><b>📞 Phone:</b> {phone}</div>"
+                    f"<div><b>🏠 Address:</b> {address}</div>"
+                    f"<div><b>⚠️ Allergies:</b> {allergy}</div>"
+                    f"<div><b>🆔 Patient ID:</b> {pid}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+            with notes_col:
+                doc_notes = grp.get("doctor_notes") or ""
+                doc_name  = grp.get("doctor_name")  or "—"
+                cons_date = grp.get("consultation_date") or ""
+                if cons_date:
+                    try:
+                        cons_date = datetime.fromisoformat(cons_date).strftime(
+                            "%d %b %Y, %I:%M %p"
+                        )
+                    except (ValueError, TypeError):
+                        pass
+
+                if doc_notes:
+                    st.markdown(f"**🩺 Dr. {doc_name}** — _{cons_date}_")
+                    st.caption(
+                        doc_notes[:300]
+                        + ("…" if len(doc_notes) > 300 else "")
+                    )
+                    # Expandable full notes
+                    if len(doc_notes) > 300:
+                        with st.popover("📋 Full Doctor Notes"):
+                            st.markdown(doc_notes)
+                else:
+                    st.caption("No consultation notes available.")
+
+                # Button to load consultation history
+                if st.button(
+                    "📜 View Consultation History",
+                    key=f"cons_hist_{pid}",
+                ):
+                    consults = _load_consultations(pid)
+                    if consults:
+                        for c in consults:
+                            c_date = c.get("created_at", "")
+                            if c_date:
+                                try:
+                                    c_date = datetime.fromisoformat(c_date).strftime(
+                                        "%d %b %Y"
+                                    )
+                                except (ValueError, TypeError):
+                                    pass
+                            st.markdown(
+                                f"**Dr. {c.get('doctor_name', '?')}** — {c_date}  \n"
+                                f"_{c.get('text', '')[:200]}_"
+                            )
+                    else:
+                        st.info("No consultation records found.")
+
+            st.divider()
+
+            # ── Column headers ───────────────────────────────
+            hdr = st.columns([3, 2, 2, 2, 2, 2, 3])
+            hdr[0].markdown("**Medicine**")
+            hdr[1].markdown("**Dosage**")
+            hdr[2].markdown("**Duration**")
+            hdr[3].markdown("**AI Qty**")
+            hdr[4].markdown("**Final Qty**")
+            hdr[5].markdown("**Status**")
+            hdr[6].markdown("**Actions**")
+
+            # ── Medicine rows ────────────────────────────────
+            for idx, med in enumerate(meds):
+                oid      = med.get("order_id", 0)
+                medicine = med.get("medicine", med.get("order_type", "N/A"))
+                dosage   = med.get("dosage", "As directed")
+                duration = med.get("duration", "As directed")
+                status   = med.get("status", "pending")
+                urg      = _urgency_level(medicine)
+
+                qty_key       = f"ph_qty_{oid}"
+                final_key     = f"ph_final_qty_{oid}"
+                confirmed_key = f"ph_confirmed_{oid}"
+                has_ai        = qty_key in st.session_state
+                is_confirmed  = confirmed_key in st.session_state
+
+                # Urgency wrapper
+                urg_cls = _urgency_css_class(medicine)
+                st.markdown(
+                    f"<div class='{urg_cls}'>",
+                    unsafe_allow_html=True,
+                )
+
+                r = st.columns([3, 2, 2, 2, 2, 2, 3])
+
+                with r[0]:
+                    urg_html = _urgency_badge(medicine)
+                    st.markdown(
+                        f"**💊 {medicine}** {urg_html}",
+                        unsafe_allow_html=True,
+                    )
+                with r[1]:
+                    st.markdown(dosage)
+                with r[2]:
+                    st.markdown(duration)
+                with r[3]:
+                    if has_ai:
+                        qd = st.session_state[qty_key]
+                        st.markdown(
+                            f"**{qd.get('quantity', '?')} "
+                            f"{qd.get('unit', 'units')}**"
+                        )
+                    else:
+                        st.markdown("*—*")
+                with r[4]:
+                    if is_confirmed:
+                        cq = st.session_state[confirmed_key]["quantity"]
+                        ai_u = (
+                            st.session_state[qty_key].get("unit", "units")
+                            if has_ai else "units"
+                        )
+                        st.markdown(f"**✅ {cq} {ai_u}**")
+                    else:
+                        default = 0
+                        if has_ai:
+                            aq = st.session_state[qty_key].get("quantity", 0)
+                            default = int(aq) if str(aq).isdigit() else 0
+                        tab1_key = f"t1_{final_key}"
+                        st.number_input(
+                            "Qty",
+                            min_value=0,
+                            value=default,
+                            step=1,
+                            key=tab1_key,
+                            label_visibility="collapsed",
+                        )
+                with r[5]:
+                    st.markdown(_status_badge(status), unsafe_allow_html=True)
+                with r[6]:
+                    bc1, bc2, bc3 = st.columns(3)
+                    with bc1:
+                        if not has_ai and not is_confirmed:
+                            if st.button(
+                                "🤖 Calc",
+                                key=f"ocalc_{oid}_{idx}",
+                                use_container_width=True,
+                            ):
+                                with st.spinner("…"):
+                                    st.session_state[qty_key] = (
+                                        _calculate_medicine_quantity(oid)
+                                    )
+                                    st.rerun()
+                    with bc2:
+                        if has_ai and not is_confirmed:
+                            if st.button(
+                                "✅ Confirm",
+                                key=f"oconf_{oid}_{idx}",
+                                type="primary",
+                                use_container_width=True,
+                            ):
+                                t1_fk = f"t1_ph_final_qty_{oid}"
+                                val = st.session_state.get(t1_fk, 0)
+                                st.session_state[confirmed_key] = {
+                                    "quantity": val,
+                                    "confirmed": True,
+                                }
+                                st.rerun()
+                    with bc3:
+                        if st.button(
+                            "📩 Remind",
+                            key=f"orem_{oid}_{idx}",
+                            use_container_width=True,
+                        ):
+                            with st.spinner("…"):
+                                res = _send_patient_reminder(oid)
+                                st.session_state[f"ph_rem_{oid}"] = res
+                                st.rerun()
+
+                # Close urgency div
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                # Show per‑medicine AI explanation
+                if has_ai:
+                    expl = st.session_state[qty_key].get("calculation", "")
+                    if expl:
+                        st.caption(f"📝 _{expl}_")
+
+                # Show per‑medicine reminder
+                rem_k = f"ph_rem_{oid}"
+                if rem_k in st.session_state:
+                    rd = st.session_state[rem_k]
+                    ic = {"refill": "🔄", "followup": "🏥", "ongoing": "💊"}.get(
+                        rd.get("type", ""), "📩"
+                    )
+                    st.success(f"{ic} _{rd.get('message', '')}_")
+
+                if idx < n - 1:
+                    st.markdown("<hr class='ph-divider'>", unsafe_allow_html=True)
+
+            # ── Patient‑level actions ────────────────────────
+            st.markdown("")
+            pa = st.columns(5)
+
+            with pa[0]:
+                if st.button(
+                    "🤖 Calculate All Qty",
+                    key=f"pcalc_{pid}",
+                    use_container_width=True,
+                ):
+                    bar = st.progress(0, text="Calculating …")
+                    for i, m in enumerate(meds):
+                        o = m["order_id"]
+                        if f"ph_qty_{o}" not in st.session_state:
+                            st.session_state[f"ph_qty_{o}"] = (
+                                _calculate_medicine_quantity(o)
+                            )
+                        bar.progress((i + 1) / n, text=f"{i+1}/{n}")
+                    bar.empty()
+                    st.rerun()
+
+            with pa[1]:
+                # Confirm all for this patient
+                has_any_ai = any(
+                    f"ph_qty_{m['order_id']}" in st.session_state
+                    for m in meds if m.get("status") != "completed"
+                )
+                if has_any_ai and st.button(
+                    f"✅ Confirm All for {name}",
+                    key=f"pconf_{pid}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    cnt = 0
+                    for m in meds:
+                        o = m["order_id"]
+                        fk = f"t1_ph_final_qty_{o}"
+                        if (
+                            fk in st.session_state
+                            and f"ph_confirmed_{o}" not in st.session_state
+                        ):
+                            st.session_state[f"ph_confirmed_{o}"] = {
+                                "quantity": st.session_state[fk],
+                                "confirmed": True,
+                            }
+                            cnt += 1
+                    if cnt:
+                        st.success(f"Confirmed {cnt} prescriptions for {name}.")
+                        st.rerun()
+
+            with pa[2]:
+                non_done = [m for m in meds if m.get("status") != "completed"]
+                if non_done and st.button(
+                    "✅ Dispense All",
+                    key=f"pdisp_{pid}",
+                    use_container_width=True,
+                ):
+                    for m in non_done:
+                        _update_status(m["order_id"], "completed")
+
+            with pa[3]:
+                pend = [
+                    m for m in meds if m.get("status") in ("pending", "sent")
+                ]
+                if pend and st.button(
+                    "🔵 In Progress",
+                    key=f"pprog_{pid}",
+                    use_container_width=True,
+                ):
+                    for m in pend:
+                        _update_status(m["order_id"], "in_progress")
+
+            with pa[4]:
+                if st.button(
+                    "📩 Remind Patient",
+                    key=f"premind_{pid}",
+                    use_container_width=True,
+                ):
+                    with st.spinner("Generating reminder …"):
+                        first_oid = meds[0]["order_id"]
+                        result = _send_patient_reminder(first_oid)
+                        st.session_state[f"ph_rem_patient_{pid}"] = result
+                        st.rerun()
+
+            # Patient‑level reminder
+            prk = f"ph_rem_patient_{pid}"
+            if prk in st.session_state:
+                rd = st.session_state[prk]
+                ic = {"refill": "🔄", "followup": "🏥", "ongoing": "💊"}.get(
+                    rd.get("type", ""), "📩"
+                )
+                st.success(
+                    f"{ic} **Reminder for {name}:**  \n_{rd.get('message', '')}_"
+                )
+
+
+# ═══════════════════════════════════════════════════════════
+#  TAB 2 — AI Quantity Review (grouped by patient)
+# ═══════════════════════════════════════════════════════════
+
+def _render_ai_review(groups: list[dict]):
+    st.markdown("#### 🤖 AI Medicine Quantity Review")
+    st.caption(
+        "AI analyses each prescription against consultation notes. "
+        "Review, edit, then confirm per patient or in bulk."
+    )
+
+    if not groups:
+        st.info("No prescriptions match the current filters.")
+        return
+
+    # Active (non‑completed) across all patients
+    all_active: list[dict] = []
+    for g in groups:
+        for m in g["medicines"]:
+            if m.get("status") != "completed":
+                all_active.append(m)
+
+    if not all_active:
+        st.success("All prescriptions have been completed! 🎉")
+        return
+
+    # ── Global batch actions ─────────────────────────────────
+    bc1, bc2, bc3 = st.columns([2, 2, 4])
+    with bc1:
+        if st.button(
+            "🤖 Calculate All Patients",
+            type="primary",
+            use_container_width=True,
+            key="ai_calc_glob",
+        ):
+            bar = st.progress(0, text="Calculating …")
+            for i, med in enumerate(all_active):
+                o = med["order_id"]
+                if f"ph_qty_{o}" not in st.session_state:
+                    st.session_state[f"ph_qty_{o}"] = (
+                        _calculate_medicine_quantity(o)
+                    )
+                bar.progress(
+                    (i + 1) / len(all_active),
+                    text=f"{i+1}/{len(all_active)}",
+                )
+            bar.empty()
+            st.rerun()
+
+    with bc2:
+        if st.button(
+            "✅ Confirm All Patients",
+            use_container_width=True,
+            key="ai_confirm_glob",
+        ):
+            cnt = 0
+            for med in all_active:
+                o  = med["order_id"]
+                fk = f"t2_ph_final_qty_{o}"
+                if (
+                    fk in st.session_state
+                    and f"ph_confirmed_{o}" not in st.session_state
+                ):
+                    st.session_state[f"ph_confirmed_{o}"] = {
+                        "quantity": st.session_state[fk],
+                        "confirmed": True,
+                    }
+                    cnt += 1
+            if cnt:
+                st.success(f"Confirmed {cnt} prescriptions.")
+                st.rerun()
+            else:
+                st.warning("Calculate AI suggestions first.")
+
+    with bc3:
+        calc_n = sum(
+            1 for m in all_active if f"ph_qty_{m['order_id']}" in st.session_state
+        )
+        conf_n = sum(
+            1 for m in all_active
+            if f"ph_confirmed_{m['order_id']}" in st.session_state
+        )
+        st.caption(
+            f"👥 {len(groups)} patients  •  "
+            f"💊 {len(all_active)} active  •  "
+            f"🤖 {calc_n} calculated  •  "
+            f"✅ {conf_n} confirmed"
+        )
+
+    st.divider()
+
+    # ── Per‑patient review cards ─────────────────────────────
+    for grp in groups:
+        pid  = grp["patient_id"]
+        name = grp["patient_name"]
+        active = [m for m in grp["medicines"] if m.get("status") != "completed"]
+        if not active:
+            continue
+
+        all_confirmed = all(
+            f"ph_confirmed_{m['order_id']}" in st.session_state for m in active
+        )
+
+        with st.container(border=True):
+            # Header
+            hc1, hc2 = st.columns([5, 3])
+            with hc1:
+                st.markdown(f"### 👤 {name}")
+                allergy = grp.get("allergies")
+                caption = (
+                    f"ID: {pid}  •  "
+                    f"{len(active)} active rx"
+                )
+                if allergy:
+                    caption += f"  •  ⚠️ Allergies: {allergy}"
+                st.caption(caption)
+            with hc2:
+                if all_confirmed:
+                    st.markdown(
+                        "<span class='ph-badge ph-badge-green' "
+                        "style='font-size:15px;'>✅ All Confirmed</span>",
+                        unsafe_allow_html=True,
+                    )
+
+            # Doctor notes summary
+            doc = grp.get("doctor_notes", "")
+            if doc:
+                with st.popover("🩺 View Doctor Notes"):
+                    st.markdown(
+                        f"**Dr. {grp.get('doctor_name', '?')}**  \n"
+                        f"{doc}"
+                    )
+
+            # ── Medicine rows ────────────────────────────────
+            for idx, med in enumerate(active):
+                oid      = med.get("order_id", 0)
+                medicine = med.get("medicine", med.get("order_type", "N/A"))
+                dosage   = med.get("dosage", "As directed")
+                duration = med.get("duration", "As directed")
+
+                qty_key       = f"ph_qty_{oid}"
+                final_key     = f"ph_final_qty_{oid}"
+                confirmed_key = f"ph_confirmed_{oid}"
+                has_ai        = qty_key in st.session_state
+                is_confirmed  = confirmed_key in st.session_state
+
+                # Row
+                urg_html = _urgency_badge(medicine)
+                st.markdown(
+                    f"{_qty_state_badge(oid)} {urg_html}",
+                    unsafe_allow_html=True,
+                )
+
+                c = st.columns([3, 2, 2, 2, 2])
+
+                with c[0]:
+                    st.markdown(f"**💊 {medicine}**")
+                with c[1]:
+                    st.caption("Dosage")
+                    st.markdown(f"**{dosage}**")
+                with c[2]:
+                    st.caption("Duration")
+                    st.markdown(f"**{duration}**")
+                with c[3]:
+                    if has_ai:
+                        qd = st.session_state[qty_key]
+                        ai_qty  = qd.get("quantity", 0)
+                        ai_unit = qd.get("unit", "units")
+                        st.caption(f"🤖 AI: **{ai_qty} {ai_unit}**")
+                    else:
+                        ai_qty  = 0
+                        ai_unit = "units"
+                        st.caption("🤖 Not calculated")
+                with c[4]:
+                    if is_confirmed:
+                        cq = st.session_state[confirmed_key]["quantity"]
+                        st.caption("✅ Final Qty")
+                        st.markdown(f"**{cq} {ai_unit}**")
+                    else:
+                        default = int(ai_qty) if str(ai_qty).isdigit() else 0
+                        tab2_key = f"t2_{final_key}"
+                        st.number_input(
+                            "Qty",
+                            min_value=0,
+                            value=default,
+                            step=1,
+                            key=tab2_key,
+                            label_visibility="collapsed",
+                        )
+
+                # Explanation
+                if has_ai:
+                    expl = st.session_state[qty_key].get("calculation", "")
+                    if expl:
+                        st.caption(f"📝 _{expl}_")
+
+                # Per‑line actions
+                act1, act2 = st.columns(2)
+                with act1:
+                    if not has_ai and not is_confirmed:
+                        if st.button("🤖 Calculate", key=f"aiq_l_{oid}_{idx}"):
+                            with st.spinner("…"):
+                                st.session_state[qty_key] = (
+                                    _calculate_medicine_quantity(oid)
+                                )
+                                st.rerun()
+                with act2:
+                    if has_ai and not is_confirmed:
+                        if st.button(
+                            "✅ Confirm",
+                            key=f"aiq_conf_{oid}_{idx}",
+                            type="primary",
+                        ):
+                            t2_fk = f"t2_ph_final_qty_{oid}"
+                            val = st.session_state.get(t2_fk, 0)
+                            st.session_state[confirmed_key] = {
+                                "quantity": val,
+                                "confirmed": True,
+                            }
+                            st.rerun()
+
+                if idx < len(active) - 1:
+                    st.markdown(
+                        "<hr class='ph-divider'>",
+                        unsafe_allow_html=True,
+                    )
+
+            # Per‑patient actions
+            st.markdown("")
+            pa1, pa2 = st.columns(2)
+            with pa1:
+                uncalc = [
+                    m for m in active
+                    if f"ph_qty_{m['order_id']}" not in st.session_state
+                ]
+                if uncalc and st.button(
+                    "🤖 Calculate All",
+                    key=f"aiq_ca_{pid}",
+                    use_container_width=True,
+                ):
+                    bar = st.progress(0)
+                    for i, m in enumerate(uncalc):
+                        st.session_state[f"ph_qty_{m['order_id']}"] = (
+                            _calculate_medicine_quantity(m["order_id"])
+                        )
+                        bar.progress((i + 1) / len(uncalc))
+                    bar.empty()
+                    st.rerun()
+
+            with pa2:
+                unconf = [
+                    m for m in active
+                    if f"ph_confirmed_{m['order_id']}" not in st.session_state
+                    and f"ph_qty_{m['order_id']}" in st.session_state
+                ]
+                if unconf and st.button(
+                    f"✅ Confirm All for {name}",
+                    key=f"aiq_cf_{pid}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    for m in unconf:
+                        o  = m["order_id"]
+                        fk = f"t2_ph_final_qty_{o}"
+                        st.session_state[f"ph_confirmed_{o}"] = {
+                            "quantity": st.session_state.get(fk, 0),
+                            "confirmed": True,
+                        }
+                    st.success(f"Confirmed {len(unconf)} prescriptions for {name}.")
+                    st.rerun()
